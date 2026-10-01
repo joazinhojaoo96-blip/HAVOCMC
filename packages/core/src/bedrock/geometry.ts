@@ -1,0 +1,276 @@
+import type { JavaElement, JavaFaceName } from "../java/model.js";
+import type { AtlasPlacement } from "../image/atlas.js";
+
+/**
+ * Java block-model element → Bedrock geometry conversion.
+ *
+ * Coordinate mapping (matches java2bedrock.sh, which Geyser packs use in the wild):
+ *   origin = [8 - to.x, from.y, from.z - 8]
+ *   size   = to - from
+ *   pivot  = [8 - rot.origin.x, rot.origin.y, rot.origin.z - 8]
+ *   rotation: x-axis → [-angle,0,0], y-axis → [0,-angle,0], z-axis → [0,0,angle]
+ * Cubes hang off a bone chain geysercmd → _x → _y → _z (pivot [0,8,0]) so that
+ * Java display-transform rotations can be applied per-axis in the right order.
+ */
+
+interface BedrockFaceUv {
+  uv: [number, number];
+  uv_size: [number, number];
+}
+
+interface BedrockCube {
+  origin: [number, number, number];
+  size: [number, number, number];
+  pivot?: [number, number, number];
+  rotation?: [number, number, number];
+  uv: Partial<Record<JavaFaceName, BedrockFaceUv>>;
+}
+
+export interface GeometryBuild {
+  geometry: object;
+  /** True if any face used a UV rotation (requires newer format on the client). */
+  usedUvRotation: boolean;
+}
+
+export const BONE_ROOT = "geysercmd";
+export const BONE_X = "geysercmd_x";
+export const BONE_Y = "geysercmd_y";
+export const BONE_Z = "geysercmd_z";
+
+export function buildGeometry(
+  identifier: string,
+  elements: JavaElement[],
+  faceTexture: (element: JavaElement, face: JavaFaceName) => AtlasPlacement | undefined,
+  atlasSize: { width: number; height: number },
+  options?: {
+    /**
+     * Rotate the finished geometry 180° about its vertical axis. Bedrock's
+     * built-in crossbow first-person hold points the item bone the opposite
+     * way to how the Java model is authored, so a converted crossbow renders
+     * facing backward (string outward). Flipping the geometry re-aims it while
+     * leaving the software-rendered icon (built from the raw Java model)
+     * untouched.
+     */
+    flipFacing?: boolean;
+    /**
+     * The model's `texture_size` (UV authoring resolution). Face `uv`s are in
+     * this space, not a fixed 0–16 — HD models set e.g. [128,128]. Defaults to
+     * [16,16], so ordinary models are unaffected.
+     */
+    textureSize?: [number, number];
+  },
+): GeometryBuild {
+  const [texSizeU, texSizeV] = options?.textureSize ?? [16, 16];
+  let usedUvRotation = false;
+  const cubes: BedrockCube[] = [];
+
+  for (const element of elements) {
+    let { from, to } = element;
+    // Java "rescale: true" scales the element by 1/cos(angle) on the axes
+    // perpendicular to the rotation axis (about the rotation origin). Bedrock
+    // has no rescale flag, so bake the scaling into the cube coordinates.
+    if (element.rotation?.rescale === true && element.rotation.angle !== 0) {
+      const f = 1 / Math.cos((Math.abs(element.rotation.angle) * Math.PI) / 180);
+      const o = element.rotation.origin;
+      const axisIndex = { x: 0, y: 1, z: 2 }[element.rotation.axis];
+      const scaleCoord = (v: [number, number, number]): [number, number, number] =>
+        v.map((c, i) => (i === axisIndex ? c : o[i]! + (c - o[i]!) * f)) as [number, number, number];
+      from = scaleCoord(from);
+      to = scaleCoord(to);
+    }
+    const cube: BedrockCube = {
+      origin: [8 - to[0], from[1], from[2] - 8],
+      size: [to[0] - from[0], to[1] - from[1], to[2] - from[2]],
+      uv: {},
+    };
+
+    // Guard against models with a rotation object but missing/zero angle —
+    // emitting null/NaN in the rotation array makes Bedrock reject the whole
+    // geometry (renders invisible).
+    const angle = element.rotation?.angle ?? 0;
+    if (element.rotation !== undefined && angle !== 0 && Number.isFinite(angle)) {
+      const { origin, axis } = element.rotation;
+      cube.pivot = [8 - origin[0], origin[1], origin[2] - 8];
+      cube.rotation =
+        axis === "x" ? [-angle, 0, 0] : axis === "y" ? [0, -angle, 0] : [0, 0, angle];
+    }
+
+    for (const faceName of ["north", "south", "east", "west", "up", "down"] as JavaFaceName[]) {
+      const face = element.faces?.[faceName];
+      if (face === undefined) continue;
+      const placement = faceTexture(element, faceName);
+      if (placement === undefined) continue;
+
+      // Default UVs derive from the unscaled element bounds (rescale moves
+      // vertices, not texture coordinates).
+      // Explicit `uv` is in texture_size space; an omitted uv defaults to the
+      // element bounds in 0–16 block space (Java's auto-UV), so normalize each
+      // by the right divisor before mapping into the atlas tile's pixels.
+      const explicitUv = face.uv;
+      const uvRaw = explicitUv ?? defaultUv(faceName, element.from, element.to);
+      const divU = explicitUv !== undefined ? texSizeU : 16;
+      const divV = explicitUv !== undefined ? texSizeV : 16;
+      const sx = placement.width / divU;
+      const sy = placement.height / divV;
+      let [u1, v1, u2, v2] = uvRaw;
+      const bedrockUv: BedrockFaceUv & { uv_rotation?: number } = {
+        uv: [placement.x + u1 * sx, placement.y + v1 * sy],
+        uv_size: [(u2 - u1) * sx, (v2 - v1) * sy],
+      };
+      if (face.rotation !== undefined && face.rotation !== 0) {
+        bedrockUv.uv_rotation = face.rotation;
+        usedUvRotation = true;
+      }
+      cube.uv[faceName] = bedrockUv;
+    }
+    cubes.push(cube);
+  }
+
+  // The flip can introduce uv_rotation on the up/down faces, which is a 1.21+
+  // geometry feature — fold that into the format_version decision below rather
+  // than emitting a rotation an older client would ignore.
+  if (options?.flipFacing === true && flip180AboutY(cubes)) usedUvRotation = true;
+
+  // Visible bounds from actual extents — undersized bounds make large models
+  // (greatswords, backpacks) pop out of view at screen edges.
+  let maxHorizontal = 16;
+  let minY = 0;
+  let maxY = 16;
+  for (const cube of cubes) {
+    maxHorizontal = Math.max(
+      maxHorizontal,
+      Math.abs(cube.origin[0]),
+      Math.abs(cube.origin[0] + cube.size[0]),
+      Math.abs(cube.origin[2]),
+      Math.abs(cube.origin[2] + cube.size[2]),
+    );
+    minY = Math.min(minY, cube.origin[1]);
+    maxY = Math.max(maxY, cube.origin[1] + cube.size[1]);
+  }
+  const boundsWidth = Math.max(4, Math.ceil((maxHorizontal * 2) / 16) + 1);
+  const boundsHeight = Math.max(4.5, Math.ceil((maxY - minY) / 16) + 1.5);
+
+  const geometry = {
+    format_version: usedUvRotation ? "1.21.0" : "1.16.0",
+    "minecraft:geometry": [
+      {
+        description: {
+          identifier,
+          texture_width: atlasSize.width,
+          texture_height: atlasSize.height,
+          visible_bounds_width: boundsWidth,
+          visible_bounds_height: boundsHeight,
+          visible_bounds_offset: [0, (minY + maxY) / 32, 0],
+        },
+        bones: [
+          {
+            name: BONE_ROOT,
+            binding: "c.item_slot == 'head' ? 'head' : q.item_slot_to_bone_name(c.item_slot)",
+            pivot: [0, 8, 0],
+          },
+          { name: BONE_X, parent: BONE_ROOT, pivot: [0, 8, 0] },
+          { name: BONE_Y, parent: BONE_X, pivot: [0, 8, 0] },
+          { name: BONE_Z, parent: BONE_Y, pivot: [0, 8, 0], cubes },
+        ],
+      },
+    ],
+  };
+
+  return { geometry, usedUvRotation };
+}
+
+/**
+ * Rotate every cube 180° about the vertical axis through the model's horizontal
+ * centre (in place). Position: (x,z) reflect about the centre; pivots likewise.
+ * Rotation: baking a 180° Y turn into a cube's own single-axis rotation is
+ *   X-axis angle → −angle,  Z-axis angle → −angle,  Y-axis angle → angle + 180.
+ * The Y case matters for models built from Y-splayed parts (a crossbow's limbs):
+ * reflecting their positions alone leaves each limb still angled the original
+ * way, so the whole model reads as 180° off. Adding 180° to the Y angle turns
+ * each limb to match. Our cubes only ever carry a single-axis rotation.
+ */
+function flip180AboutY(cubes: BedrockCube[]): boolean {
+  if (cubes.length === 0) return false;
+  let addedRotation = false;
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const c of cubes) {
+    minX = Math.min(minX, c.origin[0]);
+    maxX = Math.max(maxX, c.origin[0] + c.size[0]);
+    minZ = Math.min(minZ, c.origin[2]);
+    maxZ = Math.max(maxZ, c.origin[2] + c.size[2]);
+  }
+  const cx = (minX + maxX) / 2;
+  const cz = (minZ + maxZ) / 2;
+  for (const c of cubes) {
+    // After a 180° turn the cube's far corner becomes its near corner.
+    c.origin = [2 * cx - (c.origin[0] + c.size[0]), c.origin[1], 2 * cz - (c.origin[2] + c.size[2])];
+    if (c.rotation) {
+      const [rx, ry, rz] = c.rotation;
+      c.rotation = [
+        rx === 0 ? 0 : -rx,
+        ry === 0 ? 0 : wrapDegrees(ry + 180),
+        rz === 0 ? 0 : -rz,
+      ];
+    }
+    if (c.pivot) c.pivot = [2 * cx - c.pivot[0], c.pivot[1], 2 * cz - c.pivot[2]];
+    // Bedrock's per-face `uv` keys are world directions, not the cube's own
+    // sides. Moving the mesh alone leaves each face's artwork on the direction
+    // it started on, so a turned model shows its front on its back. The origin
+    // transform above is a point reflection in XZ, which for an axis-aligned box
+    // is exactly a rigid 180° turn — so the faces swap in pairs with no
+    // mirroring, and up/down keep their pixels but end up rotated half a turn.
+    const swap = (a: JavaFaceName, b: JavaFaceName): void => {
+      const tmp = c.uv[a];
+      c.uv[a] = c.uv[b];
+      c.uv[b] = tmp;
+      if (c.uv[a] === undefined) delete c.uv[a];
+      if (c.uv[b] === undefined) delete c.uv[b];
+    };
+    swap("north", "south");
+    swap("east", "west");
+    for (const faceName of ["up", "down"] as const) {
+      const face = c.uv[faceName] as (BedrockFaceUv & { uv_rotation?: number }) | undefined;
+      if (face === undefined) continue;
+      face.uv_rotation = wrapUvRotation((face.uv_rotation ?? 0) + 180);
+      if (face.uv_rotation === 0) delete face.uv_rotation;
+      else addedRotation = true;
+    }
+  }
+  return addedRotation;
+}
+
+/** Bedrock accepts face UV rotations of 0/90/180/270 only. */
+function wrapUvRotation(deg: number): number {
+  return ((deg % 360) + 360) % 360;
+}
+
+/** Wrap an angle in degrees to (−180, 180]. */
+function wrapDegrees(deg: number): number {
+  let d = ((deg % 360) + 360) % 360;
+  if (d > 180) d -= 360;
+  return d;
+}
+
+/** Vanilla default UVs derived from element bounds (Java behaviour when face.uv is omitted). */
+export function defaultUv(
+  face: JavaFaceName,
+  from: [number, number, number],
+  to: [number, number, number],
+): [number, number, number, number] {
+  const [x1, y1, z1] = from;
+  const [x2, y2, z2] = to;
+  switch (face) {
+    case "down":
+      return [x1, 16 - z2, x2, 16 - z1];
+    case "up":
+      return [x1, z1, x2, z2];
+    case "north":
+      return [16 - x2, 16 - y2, 16 - x1, 16 - y1];
+    case "south":
+      return [x1, 16 - y2, x2, 16 - y1];
+    case "west":
+      return [z1, 16 - y2, z2, 16 - y1];
+    case "east":
+      return [16 - z2, 16 - y2, 16 - z1, 16 - y1];
+  }
+}

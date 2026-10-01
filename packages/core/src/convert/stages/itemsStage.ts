@@ -1,0 +1,522 @@
+import type { ConversionContext, GeyserItemDefinition, PipelineStage } from "../context.js";
+import {
+  extractBowPullGroups,
+  extractLegacyVariants,
+  extractModernVariants,
+  type ItemVariant,
+} from "../../java/itemVariants.js";
+import { resolveModel, spriteLayers, inferHostItemFromModel, type ResolvedModel } from "../../resolve/modelResolver.js";
+import { inferHostItemFromDefinition } from "../../java/definitionHost.js";
+import { parseResourceLocation } from "../../java/javaPack.js";
+import { alphaBleed, cloneImage, compositeLayers, decodeCached, encodePng, firstFrame, tint, type RgbaImage } from "../../image/png.js";
+import { buildGeometry } from "../../bedrock/geometry.js";
+import { buildDisplayAnimations } from "../../bedrock/animations.js";
+import { buildFlipbookRenderController, buildItemAttachable } from "../../bedrock/attachable.js";
+import { parseLenientJson } from "../../java/json.js";
+import { frameTicks } from "../../java/mcmeta.js";
+import { fitFilePath, fitPathName } from "../../util/packPath.js";
+import type { JavaElement } from "../../java/model.js";
+
+/** Sanitize a resource location into a safe identifier chunk. */
+export function safeName(id: string): string {
+  return id.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+/**
+ * Path budgets (see {@link fitPathName}): the longest path each generated name
+ * ends up inside, minus the name. Bedrock warns at 80 characters, and a pack
+ * that obfuscates model ids into UUIDs blows through that on its own.
+ */
+/** `textures/geyser_custom/<name>_rrggbb.png` — the dye-tinted icon variant. */
+const ICON_PATH_RESERVED = "textures/geyser_custom/_rrggbb.png".length;
+/** `textures/geyser_custom/anim/<name>_99.png` — one file per held-animation frame. */
+const HELD_FRAME_PATH_RESERVED = "textures/geyser_custom/anim/_99.png".length;
+
+interface EncodeJob {
+  path: string;
+  image: RgbaImage;
+}
+
+const ENCODE_POOL_THRESHOLD = 24;
+
+function prettyName(id: string): string {
+  const path = parseResourceLocation(id).path;
+  const last = path.split("/").pop() ?? path;
+  return last
+    .split(/[_\-]/)
+    .map((w) => (w.length > 0 ? w[0]!.toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
+/**
+ * Converts custom item variants (legacy custom_model_data overrides and modern
+ * item definitions). 2D sprites are fully handled here; 3D geometry variants
+ * are collected and handed to the geometry stage via ctx (milestone 3).
+ */
+export const itemsStage: PipelineStage = {
+  name: "items",
+  async run(ctx: ConversionContext): Promise<void> {
+    // Detect bow-pull groups first so their models are skipped in the normal
+    // legacy + modern variant extraction (they get charge-progress controllers).
+    const { groups: bowPullGroups, consumedKeys, consumedModernKeys } = extractBowPullGroups(ctx.java);
+    ctx.bowPullGroups = bowPullGroups;
+    const legacy = extractLegacyVariants(ctx.java, consumedKeys);
+    const modern = extractModernVariants(ctx.java, consumedModernKeys);
+    // Consolidate unsupported entries by reason — 76 identical "using_item"
+    // condition skips become one report line instead of 76.
+    const byReason = new Map<string, string[]>();
+    for (const u of [...legacy.unsupported, ...modern.unsupported]) {
+      const arr = byReason.get(u.reason) ?? [];
+      arr.push(u.origin);
+      byReason.set(u.reason, arr);
+    }
+    for (const [reason, origins] of byReason) {
+      if (origins.length === 1) {
+        ctx.report.skipped("items", origins[0]!, reason);
+      } else {
+        ctx.report.skipped("items", `${origins.length} assets`, `${reason} (×${origins.length})`);
+      }
+    }
+
+    const variants = [...legacy.variants, ...modern.variants];
+    const seen = new Set<string>();
+    const encodeJobs: EncodeJob[] = [];
+    let done = 0;
+    for (const variant of variants) {
+      done++;
+      if (done % 25 === 0) ctx.progress("items", done, variants.length);
+      // Key on everything that makes a variant distinct — including the actual
+      // predicate values and the source discriminant (cmd / item-model id).
+      // Keying on `predicates.length` alone collapsed variants that share a
+      // model but differ in predicate values (two range_dispatch thresholds, a
+      // condition's on_true/on_false both pointing at one model).
+      const dedupeKey = `${variant.baseItem ?? "?"}|${JSON.stringify(variant.source)}|${variant.model}|${JSON.stringify(variant.predicates)}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      try {
+        convertVariant(ctx, variant, encodeJobs);
+      } catch (err) {
+        ctx.report.error("items", `${variant.origin} → ${variant.model}`, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    // Flush PNG encodes in parallel via the worker pool when available.
+    if (encodeJobs.length > 0) {
+      const encoder = ctx.options.pngEncoder;
+      if (encoder !== undefined && encodeJobs.length >= ENCODE_POOL_THRESHOLD) {
+        const pngs = await encoder.encode(encodeJobs.map((j) => j.image));
+        encodeJobs.forEach((j, i) => ctx.bedrock.write(j.path, pngs[i]!));
+      } else {
+        for (const j of encodeJobs) ctx.bedrock.write(j.path, encodePng(j.image));
+      }
+    }
+
+    ctx.progress("items", variants.length, variants.length);
+  },
+};
+
+function convertVariant(ctx: ConversionContext, variant: ItemVariant, encodeJobs: EncodeJob[]): void {
+  const origin = `${variant.origin} → ${variant.model}`;
+  const resolved = resolveModel(ctx.java, variant.model, ctx.resolvedModels);
+  if (resolved === undefined) {
+    ctx.report.skipped("items", origin, `model ${variant.model} not found in pack (vanilla or missing)`);
+    return;
+  }
+
+  switch (resolved.kind) {
+    case "sprite":
+    case "sprite_handheld":
+      convertSpriteVariant(ctx, variant, resolved, encodeJobs);
+      return;
+    case "geometry":
+      // Handed off to the 3D geometry stage.
+      ctx.pendingGeometry.push({ variant, resolved });
+      return;
+    case "builtin_entity":
+      ctx.report.skipped("items", origin, "builtin/entity model (chest/shield/trident style) — needs hardcoded geometry, not yet supported");
+      return;
+    default:
+      ctx.report.skipped("items", origin, `unclassifiable model (terminal parent: ${resolved.terminalParent ?? "none"})`);
+  }
+}
+
+/** Vanilla items whose layer0 gets a server-side colour tint Java applies at render time. */
+const TINTED_BASE_ITEMS = new Set([
+  "minecraft:leather_helmet", "minecraft:leather_chestplate", "minecraft:leather_leggings",
+  "minecraft:leather_boots", "minecraft:leather_horse_armor", "minecraft:potion",
+  "minecraft:splash_potion", "minecraft:lingering_potion", "minecraft:tipped_arrow",
+  "minecraft:filled_map", "minecraft:firework_star",
+]);
+
+function convertSpriteVariant(ctx: ConversionContext, variant: ItemVariant, resolved: ResolvedModel, encodeJobs: EncodeJob[]): void {
+  const origin = `${variant.origin} → ${variant.model}`;
+  // Fixed dye colour from plugin configs — bake the server-side tint into the icon.
+  const colorHint = variant.baseItem !== undefined && TINTED_BASE_ITEMS.has(variant.baseItem)
+    ? findColorHint(ctx, variant)
+    : undefined;
+  if (variant.baseItem !== undefined && TINTED_BASE_ITEMS.has(variant.baseItem)) {
+    if (colorHint !== undefined) {
+      ctx.report.converted("items-hints", origin, [
+        `config colour #${colorHint.toString(16).padStart(6, "0")} baked into layer0`,
+      ]);
+    } else {
+      ctx.report.approximated(
+        "items",
+        origin,
+        `${variant.baseItem} tints layer0 server-side on Java — the tint cannot be applied statically, icon may look uncoloured (add "color:" to the plugin config to bake it)`,
+      );
+    }
+  }
+  const layers = spriteLayers(resolved);
+  if (layers.length === 0) {
+    ctx.report.skipped("items", origin, "sprite model has no layer textures");
+    return;
+  }
+
+  const name = fitPathName(safeName(variant.model), ICON_PATH_RESERVED);
+  const iconKey = colorHint !== undefined ? `${name}_${colorHint.toString(16)}` : name;
+  const outPath = `textures/geyser_custom/${iconKey}.png`;
+
+  // Opt-in: a single-layer animated sprite can play its animation while HELD via
+  // a flat attachable. The icon itself stays on the first frame regardless —
+  // Bedrock has no flipbook for custom item icons.
+  const heldAnimation =
+    ctx.options.animate2dHeldItems && layers.length === 1
+      ? readSpriteAnimation(ctx, layers[0]!)
+      : undefined;
+
+  if (!ctx.itemTextures.has(iconKey)) {
+    const images = [];
+    for (const layerId of layers) {
+      const texPath = ctx.java.assetPath("textures", layerId, ".png");
+      const image = decodeCached(ctx.java.read.bind(ctx.java), texPath, ctx.textureCache);
+      if (image === undefined) {
+        ctx.report.approximated("items", origin, `layer texture ${layerId} missing from pack — layer dropped`);
+        continue;
+      }
+      let img = image;
+      // Animated sprite (mcmeta flipbook): Bedrock cannot animate item icons,
+      // so crop the vertical frame strip to its first frame.
+      if (img.height > img.width && ctx.java.has(texPath + ".mcmeta")) {
+        img = firstFrame(img);
+        ctx.report.approximated("items", origin, `animated icon ${layerId} — Bedrock item icons cannot animate, first frame used`);
+      }
+      images.push(img);
+    }
+    if (images.length === 0) {
+      ctx.report.skipped("items", origin, "no layer textures found in pack");
+      return;
+    }
+    // Java tints layer0 only; overlay layers stay uncoloured. Tint a copy:
+    // firstFrame already returns a fresh image, but the common non-animated
+    // path pushed the shared cached decode, and dyeing that in place would hand
+    // every later consumer of this texture a pre-tinted copy.
+    if (colorHint !== undefined && images.length > 0) {
+      images[0] = cloneImage(images[0]!);
+      tint(images[0]!, colorHint);
+    }
+    // Alpha-bleed so bilinear filtering doesn't fringe black at sprite edges.
+    // (No padding: Bedrock stretches icons to the slot, and padding shrinks
+    // the visible art — a 16x17 sprite would render at half size.)
+    const icon = compositeLayers(images);
+    alphaBleed(icon);
+    encodeJobs.push({ path: outPath, image: icon });
+    ctx.itemTextures.set(iconKey, { textures: `textures/geyser_custom/${iconKey}` });
+  }
+
+  const definition = buildDefinition(ctx, variant, {
+    icon: iconKey,
+    displayHandheld: resolved.kind === "sprite_handheld",
+  });
+  ctx.definitionTextures.set(definition, layers);
+  const outputs = [outPath];
+  if (heldAnimation !== undefined) {
+    const note = emitHeldSpriteAnimation(ctx, definition.bedrock_identifier!, name, heldAnimation, resolved, encodeJobs);
+    if (note !== undefined) outputs.push(note);
+  }
+  ctx.report.converted("items", origin, outputs);
+}
+
+/** Frame strip + tick timing of an animated sprite layer, if it is one. */
+function readSpriteAnimation(
+  ctx: ConversionContext,
+  layerId: string,
+): { strip: RgbaImage; frametime: number } | undefined {
+  const texPath = ctx.java.assetPath("textures", layerId, ".png");
+  const meta = ctx.java.readText(texPath + ".mcmeta");
+  if (meta === undefined) return undefined;
+  const strip = decodeCached(ctx.java.read.bind(ctx.java), texPath, ctx.textureCache);
+  // A flipbook strip is a vertical column of square frames.
+  if (strip === undefined || strip.height <= strip.width) return undefined;
+  const parsed = parseLenientJson<{ animation?: { frametime?: number } }>(meta);
+  return { strip, frametime: frameTicks(parsed?.animation?.frametime) };
+}
+
+/**
+ * Emit a flat-card attachable whose render controller cycles the sprite's frames,
+ * so an animated 2D item animates while held. Bedrock cannot animate a custom
+ * item icon, so the inventory/tooltip image is unaffected (first frame). Note
+ * this replaces Bedrock's native extruded held sprite with a flat card — which
+ * is why it is opt-in.
+ */
+function emitHeldSpriteAnimation(
+  ctx: ConversionContext,
+  identifier: string,
+  iconName: string,
+  anim: { strip: RgbaImage; frametime: number },
+  resolved: ResolvedModel,
+  encodeJobs: EncodeJob[],
+): string | undefined {
+  const size = anim.strip.width;
+  const count = Math.floor(anim.strip.height / size);
+  if (count < 2) return undefined;
+
+  // The frame textures are referenced by path from the attachable, so they —
+  // not the JSON files below — set how much of the name survives here.
+  const name = fitPathName(iconName, HELD_FRAME_PATH_RESERVED);
+
+  // One texture per frame; frame 0 is the attachable's `default`.
+  const shortnames = ["default"];
+  const extraTextures: Record<string, string> = {};
+  const frameBase = `textures/geyser_custom/anim/${name}`;
+  for (let i = 0; i < count; i++) {
+    const frame: RgbaImage = {
+      width: size,
+      height: size,
+      data: anim.strip.data.slice(i * size * size * 4, (i + 1) * size * size * 4),
+    };
+    alphaBleed(frame);
+    encodeJobs.push({ path: `${frameBase}_${i}.png`, image: frame });
+    if (i > 0) {
+      extraTextures[`frame${i}`] = `${frameBase}_${i}`;
+      shortnames.push(`frame${i}`);
+    }
+  }
+
+  // Flat card: one thin element carrying the sprite on both faces, run through
+  // the normal geometry builder so it gets the standard item bone chain.
+  const element = {
+    from: [0, 0, 7.5],
+    to: [16, 16, 8.5],
+    faces: { north: { texture: "#0" }, south: { texture: "#0" } },
+  } as unknown as JavaElement;
+  const geometryId = `geometry.geyser_custom.${name}_held`;
+  const geo = buildGeometry(
+    geometryId,
+    [element],
+    () => ({ x: 0, y: 0, width: size, height: size }),
+    { width: size, height: size },
+  );
+  ctx.bedrock.writeJson(fitFilePath("models/entity/geyser_custom/", `${name}_held`, ".geo.json"), geo.geometry);
+
+  const anims = buildDisplayAnimations(`${name}_held`, resolved.display ?? {});
+  ctx.bedrock.writeJson(fitFilePath("animations/geyser_custom/", `${name}_held`, ".animation.json"), anims.file);
+
+  const renderController = `controller.render.gc_${name}_held`;
+  const fps = 20 / anim.frametime;
+  ctx.bedrock.writeJson(
+    fitFilePath("render_controllers/geyser_custom/", `${name}_held`, ".render_controllers.json"),
+    buildFlipbookRenderController({ id: renderController, frameShortnames: shortnames, fps }),
+  );
+
+  ctx.bedrock.writeJson(
+    fitFilePath("attachables/geyser_custom/", safeName(identifier.split(":")[1] ?? identifier), ".json"),
+    buildItemAttachable({
+      identifier,
+      material: ctx.options.attachableMaterial,
+      texture: `${frameBase}_0`,
+      geometry: geometryId,
+      animations: anims.refs,
+      extraTextures,
+      renderController,
+    }),
+  );
+  return `held animation: ${count} frames @ ${fps.toFixed(1)} fps (icon stays first-frame)`;
+}
+
+/** Registers a Geyser v2 mapping entry for the variant. */
+export function buildDefinition(
+  ctx: ConversionContext,
+  variant: ItemVariant,
+  bedrock: {
+    icon: string;
+    displayHandheld: boolean;
+    protectionValue?: number;
+    furnitureVanillaScale?: boolean;
+    furnitureScaleMultiplier?: number;
+    furnitureYOffset?: number;
+  },
+): GeyserItemDefinition {
+  // Resolve the host item early — it also keys the config cmd lookup below.
+  const baseItem = resolveBaseItem(ctx, variant);
+
+  // Config item key via (material, custom_model_data): the strongest link for
+  // packs that dispatch everything off vanilla items with cmd (Nexo/Oraxen).
+  const cmdValue =
+    variant.source.kind === "legacy"
+      ? variant.source.customModelData
+      : variant.predicates.find(
+          (p): p is Extract<typeof p, { type: "range_dispatch" }> =>
+            p.type === "range_dispatch" && p.property === "custom_model_data",
+        )?.threshold;
+  const configKey =
+    cmdValue !== undefined ? ctx.options.cmdItemKeys[`${baseItem}|${cmdValue}`] : undefined;
+
+  // Prefer the real display name from plugin configs over a filename guess.
+  const nameKeys = [
+    ...(configKey !== undefined ? [configKey] : []),
+    ...(variant.source.kind === "modern"
+      ? [parseResourceLocation(variant.source.itemModelId).path.toLowerCase()]
+      : []),
+    parseResourceLocation(variant.model).path.split("/").pop()!.toLowerCase(),
+  ];
+  const hintedName = nameKeys.map((k) => ctx.options.displayNameHints[k]).find((v) => v !== undefined);
+
+  // Identifier priority: config item key → item-model id (unless it's a
+  // generic vanilla id) → model path. Readable and stable even when the pack
+  // obfuscates model paths (Nexo UUID shuffling); model path disambiguates
+  // multi-model items (condition branches).
+  const modernPath =
+    variant.source.kind === "modern" ? parseResourceLocation(variant.source.itemModelId) : undefined;
+  const base =
+    configKey !== undefined
+      ? safeName(configKey)
+      : modernPath !== undefined && modernPath.namespace !== "minecraft"
+        ? safeName(modernPath.path)
+        : safeName(variant.model);
+  let identifierName = base;
+  if (ctx.usedBedrockIdentifiers.has(identifierName)) {
+    identifierName = `${base}_${safeName(variant.model)}`;
+    for (let i = 2; ctx.usedBedrockIdentifiers.has(identifierName); i++) {
+      identifierName = `${base}_${safeName(variant.model)}_${i}`;
+    }
+  }
+  ctx.usedBedrockIdentifiers.add(identifierName);
+
+  const definition: GeyserItemDefinition = {
+    type: variant.source.kind === "legacy" ? "legacy" : "definition",
+    bedrock_identifier: `geyser_custom:${identifierName}`,
+    display_name: hintedName ?? prettyName(variant.model),
+    bedrock_options: {
+      icon: bedrock.icon,
+      display_handheld: bedrock.displayHandheld,
+      allow_offhand: true,
+      ...(bedrock.protectionValue !== undefined ? { protection_value: bedrock.protectionValue } : {}),
+    },
+  };
+  if (variant.source.kind === "legacy") {
+    definition.custom_model_data = variant.source.customModelData;
+  } else {
+    definition.model = variant.source.itemModelId;
+  }
+  if (variant.predicates.length > 0) {
+    definition.predicate = variant.predicates;
+    definition.predicate_strategy = "and";
+  }
+  if (variant.priority !== undefined) {
+    definition.priority = variant.priority;
+  }
+
+  // Furniture (display-entity items from plugin configs): record a
+  // GeyserDisplayEntity extension mapping so world-placed furniture renders
+  // for Bedrock players (offsets tunable in the emitted YAML).
+  if (ctx.options.furnitureItems.length > 0) {
+    const furnitureKey = nameKeys.find((k) => ctx.options.furnitureItems.includes(k));
+    if (furnitureKey !== undefined) {
+      // Prefer GeyserDisplayEntity's legacy match (model-data) whenever the
+      // furniture item is custom_model_data-dispatched — legacy or modern.
+      // It matches the placed item's cmd directly instead of relying on
+      // Geyser having already translated it to the custom bedrock item, which
+      // hide-unmapped-vanilla-displays would otherwise hide.
+      ctx.displayEntityMappings.push({
+        key: identifierName,
+        type: baseItem,
+        identifier: identifierName,
+        ...(cmdValue !== undefined ? { modelData: cmdValue } : {}),
+        vanillaScale: bedrock.furnitureVanillaScale ?? false,
+        scaleMultiplier: bedrock.furnitureScaleMultiplier ?? 0,
+        yOffset: bedrock.furnitureYOffset ?? 0,
+      });
+    }
+  }
+
+  (ctx.geyserMappings.items[baseItem] ??= []).push(definition);
+  return definition;
+}
+
+/** Fixed dye colour hint for the variant (config key via cmd, item-model name, model name). */
+function findColorHint(ctx: ConversionContext, variant: ItemVariant): number | undefined {
+  const keys: string[] = [];
+  const cmd =
+    variant.source.kind === "legacy"
+      ? variant.source.customModelData
+      : variant.predicates.find(
+          (p): p is Extract<typeof p, { type: "range_dispatch" }> =>
+            p.type === "range_dispatch" && p.property === "custom_model_data",
+        )?.threshold;
+  if (variant.baseItem !== undefined && cmd !== undefined) {
+    const configKey = ctx.options.cmdItemKeys[`${variant.baseItem}|${cmd}`];
+    if (configKey !== undefined) keys.push(configKey);
+  }
+  if (variant.source.kind === "modern") {
+    keys.push(parseResourceLocation(variant.source.itemModelId).path.toLowerCase());
+  }
+  keys.push(parseResourceLocation(variant.model).path.split("/").pop()!.toLowerCase());
+  return keys.map((k) => ctx.options.colorHints[k]).find((v) => v !== undefined);
+}
+
+/** Host item: pack-declared → config hints → model parent chain → configurable fallback. */
+function resolveBaseItem(ctx: ConversionContext, variant: ItemVariant): string {
+  if (variant.baseItem !== undefined) return variant.baseItem;
+  // Base-item hints (parsed from Oraxen/Nexo server configs) beat the
+  // generic fallback: try the item-model name, then the model's last segment.
+  const hintKeys =
+    variant.source.kind === "modern"
+      ? [parseResourceLocation(variant.source.itemModelId).path.toLowerCase()]
+      : [];
+  hintKeys.push(parseResourceLocation(variant.model).path.split("/").pop()!.toLowerCase());
+  const hinted = hintKeys.map((k) => ctx.options.baseItemHints[k]).find((v) => v !== undefined);
+  if (hinted !== undefined) {
+    ctx.report.converted("items-hints", `${variant.origin} → ${variant.model}`, [`mapped under ${hinted}`]);
+    return hinted;
+  }
+  // Model parent chain: if the custom model parents to a specific vanilla
+  // item model (e.g. minecraft:item/diamond_sword) to inherit its display
+  // transforms, infer the host item from that ancestor. Helps packs not made
+  // with Oraxen/Nexo/ItemsAdder/CraftEngine, which don't ship a plugin config zip.
+  const inferred = inferHostItemFromModel(ctx.java, variant.model, ctx.inferredHostItems);
+  if (inferred !== undefined) {
+    ctx.report.converted(
+      "items-hints",
+      `${variant.origin} → ${variant.model}`,
+      [`host item inferred from model parent chain: ${inferred}`],
+    );
+    return inferred;
+  }
+  // Last resort before the blunt fallback: a definition that branches on a
+  // property only one vanilla item has (charge_type -> crossbow, bow/pull ->
+  // bow) names its host even when nothing else does. Most custom models parent
+  // to item/generated, so the chain above can't see this.
+  if (variant.source.kind === "modern") {
+    const fromDefinition = inferHostItemFromDefinition(
+      ctx.java,
+      variant.source.itemModelId,
+      ctx.definitionHostItems,
+    );
+    if (fromDefinition !== undefined) {
+      ctx.report.converted(
+        "items-hints",
+        `${variant.origin} → ${variant.model}`,
+        [`host item inferred from the item definition's dispatch property: ${fromDefinition}`],
+      );
+      return fromDefinition;
+    }
+  }
+  ctx.report.approximated(
+    "items",
+    `${variant.origin} → ${variant.model}`,
+    `item-model asset has no fixed host item — mapped under ${ctx.options.modernBaseItem}; upload your Oraxen/Nexo/ItemsAdder/CraftEngine config zip, a datapack, or change the "modern base item" option`,
+  );
+  ctx.fallbackBaseItemHits++;
+  return ctx.options.modernBaseItem;
+}

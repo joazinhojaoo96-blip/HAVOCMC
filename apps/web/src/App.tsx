@@ -1,0 +1,432 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { wrap, proxy, transfer, type Remote } from "comlink";
+import type { ConvertResult } from "@geyser-converter/core";
+import type { WorkerApi } from "./worker/convert.worker.js";
+import { DropZone } from "./components/DropZone.js";
+import { ProgressView } from "./components/ProgressView.js";
+import { ResultView } from "./components/ResultView.js";
+
+type Phase =
+  | { kind: "idle" }
+  | { kind: "converting"; stage: string; done: number; total: number; fileName: string }
+  | { kind: "done"; result: ConvertResult; fileName: string; packName: string }
+  | { kind: "error"; message: string };
+
+export function App() {
+  const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const [attachableMaterial, setAttachableMaterial] = useState("entity_alphatest_one_sided");
+  const [modernBaseItem, setModernBaseItem] = useState("minecraft:paper");
+  const [maxAnimationFrames, setMaxAnimationFrames] = useState(0);
+  const [optimizePack, setOptimizePack] = useState(true);
+  const [maxCompression, setMaxCompression] = useState(false);
+  const [animate2dHeldItems, setAnimate2dHeldItems] = useState(false);
+  const [oxipngLevel, setOxipngLevel] = useState(4);
+  const [showOptions, setShowOptions] = useState(false);
+  const [configZips, setConfigZips] = useState<{ name: string; bytes: Uint8Array }[]>([]);
+  // The pack is staged on drop, not converted — the user adds config zips and
+  // tweaks options first, then presses Convert.
+  const [packFiles, setPackFiles] = useState<File[]>([]);
+  // Both refs point at the same worker: the raw handle so it can be terminated,
+  // the comlink proxy for calls.
+  const workerRef = useRef<Worker | null>(null);
+  const apiRef = useRef<Remote<WorkerApi> | null>(null);
+  /**
+   * Incremented on every cancel. Reading the staged files happens before the
+   * worker exists, so Cancel during that window terminated nothing and the
+   * in-flight run went on to spawn a worker and overwrite the idle screen with
+   * a result the user had already dismissed. Each run captures the value and
+   * drops its own updates once it no longer matches.
+   */
+  const runId = useRef(0);
+
+  /**
+   * Rejects if the worker dies. A worker that never starts — its chunk missing,
+   * a parse error, module workers blocked — leaves every comlink call pending
+   * forever, so the screen sat on the first stage with nothing to explain it.
+   * Racing the call against this turns that into an error the user can act on.
+   */
+  const workerFailedRef = useRef<Promise<never> | null>(null);
+
+  const getWorker = useCallback((): { api: Remote<WorkerApi>; failed: Promise<never> } => {
+    if (apiRef.current === null || workerFailedRef.current === null) {
+      const worker = new Worker(new URL("./worker/convert.worker.ts", import.meta.url), {
+        type: "module",
+      });
+      workerRef.current = worker;
+      apiRef.current = wrap<WorkerApi>(worker);
+      const failed = new Promise<never>((_resolve, reject) => {
+        worker.onerror = (event: ErrorEvent): void => {
+          reject(
+            new Error(
+              `The background converter failed to start${event.message !== "" ? `: ${event.message}` : ""}. ` +
+                `Reload the page and try again — if it keeps happening, your browser may be blocking module workers.`,
+            ),
+          );
+        };
+        worker.onmessageerror = (): void => {
+          reject(new Error("The background converter sent a message this page could not read. Reload and try again."));
+        };
+      });
+      // Only a running conversion awaits this; keep the browser from logging an
+      // unhandled rejection while nothing is.
+      failed.catch(() => {});
+      workerFailedRef.current = failed;
+    }
+    return { api: apiRef.current, failed: workerFailedRef.current };
+  }, []);
+
+  const terminateWorker = useCallback(() => {
+    workerRef.current?.terminate();
+    workerRef.current = null;
+    apiRef.current = null;
+    workerFailedRef.current = null;
+  }, []);
+
+  const startConvert = useCallback(
+    async (files: File[]) => {
+      const myRun = runId.current;
+      const stale = (): boolean => runId.current !== myRun;
+      const first = files[0]!;
+      // Name a merged pack after its inputs, not a constant. packagingStage
+      // derives both manifest UUIDs from packName, so a fixed "Merged Pack"
+      // gave every merged pack anyone ever produced the same identity —
+      // Bedrock keys installed packs by UUID, so two different merged packs
+      // would overwrite each other on the client and a server could not ship
+      // both.
+      const strip = (n: string): string => n.replace(/\.(zip|mcpack|tgz|tar\.gz)$/i, "");
+      const packName =
+        files.length === 1
+          ? strip(first.name)
+          : `Merged: ${files.map((f) => strip(f.name)).join(" + ")}`;
+      const label = files.length === 1 ? first.name : `${files.length} packs`;
+      setPhase({ kind: "converting", stage: "reading files", done: 0, total: 1, fileName: label });
+      try {
+        // Read concurrently — order is merge priority, and Promise.all keeps it.
+        // Sequential reads left the UI pinned at 0% for seconds on a big stack.
+        const packs = await Promise.all(
+          files.map(async (f) => new Uint8Array(await f.arrayBuffer())),
+        );
+        if (stale()) return;
+        const { api, failed } = getWorker();
+        const result = await Promise.race([failed, api.convert(
+          transfer(packs, packs.map((p) => p.buffer)),
+          {
+            packName,
+            packNames: files.map((f) => f.name),
+            attachableMaterial, modernBaseItem, maxAnimationFrames, optimizePack, maxCompression, animate2dHeldItems,
+          },
+          proxy((stage: string, done: number, total: number) => {
+            if (stale()) return;
+            setPhase({ kind: "converting", stage, done, total, fileName: label });
+          }),
+          configZips.map((c) => {
+            // Copy once — configZips state may be reused on a later conversion,
+            // and transfer() neuters the buffer we hand off.
+            const copy = c.bytes.slice();
+            return transfer(copy, [copy.buffer]);
+          }),
+          oxipngLevel,
+        )]);
+        if (stale()) return;
+        setPhase({ kind: "done", result, fileName: label, packName });
+      } catch (err) {
+        if (stale()) return;
+        setPhase({ kind: "error", message: err instanceof Error ? err.message : String(err) });
+      }
+    },
+    [getWorker, attachableMaterial, modernBaseItem, maxAnimationFrames, optimizePack, maxCompression, animate2dHeldItems, oxipngLevel, configZips],
+  );
+
+  // Terminate the worker on unmount to avoid leaking a thread.
+  useEffect(() => {
+    return () => { terminateWorker(); };
+  }, [terminateWorker]);
+
+  const cancelConversion = useCallback(() => {
+    runId.current++;
+    terminateWorker();
+    setPhase({ kind: "idle" });
+  }, [terminateWorker]);
+
+  return (
+    <div style={{ maxWidth: 900, margin: "0 auto", padding: "40px 20px" }}>
+      <header style={{ textAlign:"center", marginBottom:34 }}>
+        <div style={{display:"inline-flex",alignItems:"center",gap:10,padding:"8px 14px",border:"1px solid var(--border)",borderRadius:999,background:"var(--panel)",color:"var(--muted)",fontSize:12,fontWeight:800,letterSpacing:".08em"}}>
+          ⚡ HAVOCMC TOOLS
+        </div>
+        <h1 style={{margin:"18px 0 8px",fontSize:"clamp(38px,7vw,64px)",lineHeight:1,letterSpacing:"-.04em",fontWeight:900}}>
+          Java <span style={{color:"var(--accent)"}}>→</span> Bedrock
+        </h1>
+        <p style={{color:"var(--muted)",margin:"0 auto",maxWidth:650,fontSize:16,lineHeight:1.6}}>
+          Converta resource packs do Minecraft Java para Bedrock e gere os arquivos do Geyser.
+          <br/>Tudo acontece no seu navegador. Seus arquivos não são enviados para um servidor.
+        </p>
+        <div style={{display:"flex",justifyContent:"center",gap:10,flexWrap:"wrap",marginTop:18}}>
+          <span style={badgeStyle}>🔒 Privado</span><span style={badgeStyle}>⚡ Processamento local</span><span style={badgeStyle}>📦 .mcpack + mappings</span>
+        </div>
+      </header>
+
+      {phase.kind === "idle" && (
+        <>
+          <DropZone onFiles={setPackFiles} selected={packFiles} />
+
+          {/* Compression controls — surfaced (not buried under Advanced) since size is what most people tune. */}
+          <div
+            style={{
+              background: "var(--panel)",
+              border: "1px solid var(--border)",
+              borderRadius: 12,
+              padding: 16,
+              marginTop: 16,
+              display: "grid",
+              gap: 12,
+            }}
+          >
+            <label style={{ ...labelStyle, display: "flex", flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={optimizePack}
+                onChange={(e) => setOptimizePack(e.target.checked)}
+              />
+              Lossless pack optimization — minify JSON, merge duplicate + drop unused textures (never
+              changes what players see)
+            </label>
+            <label style={{ ...labelStyle, display: "flex", flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={animate2dHeldItems}
+                onChange={(e) => setAnimate2dHeldItems(e.target.checked)}
+              />
+              Animate held 2D items — plays an animated sprite's frames while the item is held.
+              Bedrock can't animate item icons, so the inventory picture stays on the first frame,
+              and held items render as a flat card instead of Bedrock's extruded sprite.
+            </label>
+            {optimizePack && (
+              <label style={{ ...labelStyle, display: "flex", flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={maxCompression}
+                  onChange={(e) => setMaxCompression(e.target.checked)}
+                />
+                Maximum compression — losslessly recompress large textures (oxipng) for ~12% more off
+                them. Runs in a background thread; adds a minute or two on big packs.
+              </label>
+            )}
+            {optimizePack && maxCompression && (
+              <label style={{ ...labelStyle, paddingLeft: 24 }}>
+                Compression effort — level {oxipngLevel}{" "}
+                {oxipngLevel === 4 ? "(fastest)" : oxipngLevel === 6 ? "(smallest, slowest)" : "(balanced)"}
+                <input
+                  type="range"
+                  min={4}
+                  max={6}
+                  step={1}
+                  value={oxipngLevel}
+                  onChange={(e) => setOxipngLevel(Number(e.target.value))}
+                  style={{ width: "100%", maxWidth: 280 }}
+                />
+                <span style={{ fontSize: 12 }}>
+                  Higher levels trade minutes for a few % more; the gain past 4 is usually small.
+                </span>
+              </label>
+            )}
+          </div>
+
+          {/* Plugin config zips — always visible since they're critical for accuracy. */}
+          <div
+            style={{
+              background: "var(--panel)",
+              border: "1px solid var(--border)",
+              borderRadius: 12,
+              padding: 16,
+              marginTop: 16,
+              display: "grid",
+              gap: 12,
+            }}
+          >
+            <label style={labelStyle}>
+              Plugin configs & datapacks (optional, multiple allowed) — Oraxen / Nexo / ItemsAdder /
+              CraftEngine items and HMCCosmetics cosmetics. Zip each plugin's config folder (e.g.{" "}
+              <code>plugins/Nexo/items/</code>,{" "}
+              <code>plugins/CraftEngine/resources/</code>,{" "}
+              <code>plugins/HMCCosmetics/cosmetics/</code>) — upload them together or as separate
+              zips. Enables real base items, display names, armor sets, furniture, and
+              back-cosmetic positioning.
+              <br />
+              Using a <strong>datapack</strong> instead of a plugin (Stellarity, Crop &amp; Kettle,
+              anything using <code>minecraft:item_model</code>)? Drop the datapack zip here too —
+              its loot tables, recipes and advancements are what say which vanilla item each custom
+              model is attached to. Without it every item falls back to the modern base item below.
+              <input
+                type="file"
+                accept=".zip"
+                multiple
+                style={{ ...inputStyle, padding: 6 }}
+                onChange={async (e) => {
+                  const files = [...(e.target.files ?? [])];
+                  const loaded = await Promise.all(
+                    files.map(async (file) => ({
+                      name: file.name,
+                      bytes: new Uint8Array(await file.arrayBuffer()),
+                    })),
+                  );
+                  setConfigZips(loaded);
+                }}
+              />
+              {configZips.length > 0 && (
+                <span style={{ color: "var(--accent)" }}>
+                  ✓ {configZips.map((c) => c.name).join(", ")} loaded
+                </span>
+              )}
+            </label>
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <button
+              onClick={() => setShowOptions((v) => !v)}
+              style={{
+                background: "transparent",
+                color: "var(--muted)",
+                border: "none",
+                cursor: "pointer",
+                fontSize: 13,
+              }}
+            >
+              {showOptions ? "▾" : "▸"} Opções avançadas
+            </button>
+            {showOptions && (
+              <div
+                style={{
+                  background: "var(--panel)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 12,
+                  padding: 16,
+                  marginTop: 8,
+                  display: "grid",
+                  gap: 12,
+                }}
+              >
+                <label style={labelStyle}>
+                  Attachable material (3D items)
+                  <select
+                    value={attachableMaterial}
+                    onChange={(e) => setAttachableMaterial(e.target.value)}
+                    style={inputStyle}
+                  >
+                    <option value="entity_alphatest_one_sided">entity_alphatest_one_sided (default)</option>
+                    <option value="entity_alphatest">entity_alphatest</option>
+                    <option value="entity">entity (opaque)</option>
+                    <option value="entity_alphablend">entity_alphablend</option>
+                  </select>
+                </label>
+                <label style={labelStyle}>
+                  Fallback base item for modern item-model assets
+                  <input
+                    value={modernBaseItem}
+                    onChange={(e) => setModernBaseItem(e.target.value)}
+                    style={inputStyle}
+                    placeholder="minecraft:paper"
+                  />
+                </label>
+                <label style={labelStyle}>
+                  Animation quality (max flipbook frames) — lower = smaller pack, faster downloads
+                  <select
+                    value={maxAnimationFrames}
+                    onChange={(e) => setMaxAnimationFrames(Number(e.target.value))}
+                    style={inputStyle}
+                  >
+                    <option value={0}>Full animation (default)</option>
+                    <option value={20}>20 frames</option>
+                    <option value={10}>10 frames (balanced)</option>
+                    <option value={5}>5 frames (small pack)</option>
+                    <option value={1}>1 frame (no animation, smallest)</option>
+                  </select>
+                </label>
+              </div>
+            )}
+          </div>
+
+          {/* Conversion only starts here — dropping a pack just stages it, so
+              config zips and options can be set before the (long) run. */}
+          <div style={{ textAlign: "center", marginTop: 24 }}>
+            <button
+              onClick={() => {
+                if (packFiles.length > 0) void startConvert(packFiles);
+              }}
+              disabled={packFiles.length === 0}
+              style={{
+                ...buttonStyle,
+                padding: "14px 36px",
+                fontSize: 17,
+                opacity: packFiles.length === 0 ? 0.45 : 1,
+                cursor: packFiles.length === 0 ? "not-allowed" : "pointer",
+              }}
+            >
+              CONVERTER PACK
+            </button>
+            <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 8 }}>
+              {packFiles.length === 0
+                ? "Adicione um resource pack Java acima para começar."
+                : "Você pode adicionar configs de plugins e ajustar as opções antes de converter."}
+            </div>
+          </div>
+        </>
+      )}
+      {phase.kind === "converting" && (
+        <ProgressView stage={phase.stage} done={phase.done} total={phase.total} fileName={phase.fileName} onCancel={cancelConversion} />
+      )}
+      {phase.kind === "done" && (
+        <ResultView
+          result={phase.result}
+          packName={phase.packName}
+          onReset={() => setPhase({ kind: "idle" })}
+        />
+      )}
+      {phase.kind === "error" && (
+        <div
+          style={{
+            background: "var(--panel)",
+            border: "1px solid var(--err)",
+            borderRadius: 12,
+            padding: 24,
+          }}
+        >
+          <strong style={{ color: "var(--err)" }}>Conversion failed</strong>
+          <p style={{ color: "var(--muted)" }}>{phase.message}</p>
+          <button onClick={() => setPhase({ kind: "idle" })} style={buttonStyle}>
+            Try again
+          </button>
+        </div>
+      )}
+
+
+    </div>
+  );
+}
+
+const badgeStyle: React.CSSProperties = {
+  display:"inline-flex",alignItems:"center",padding:"7px 11px",borderRadius:999,
+  background:"var(--panel)",border:"1px solid var(--border)",color:"var(--muted)",fontSize:12
+};
+
+const labelStyle: React.CSSProperties = {
+  display: "grid",
+  gap: 4,
+  fontSize: 13,
+  color: "var(--muted)",
+};
+
+const inputStyle: React.CSSProperties = {
+  background: "var(--bg)",
+  color: "var(--text)",
+  border: "1px solid var(--border)",
+  borderRadius: 8,
+  padding: "8px 10px",
+  fontSize: 14,
+};
+
+export const buttonStyle: React.CSSProperties = {
+  background:"var(--accent)", color:"#07111f", border:"none", borderRadius:12,
+  padding:"12px 20px", fontSize:15, fontWeight:800, cursor:"pointer",
+  boxShadow:"0 8px 24px #60a5fa22",
+};

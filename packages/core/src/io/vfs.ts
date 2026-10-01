@@ -1,0 +1,92 @@
+/**
+ * Minimal in-memory virtual filesystem. Paths are forward-slash, no leading slash.
+ * Used for both the parsed Java pack and the Bedrock pack being built, so the
+ * core stays independent of Node/browser filesystem APIs.
+ */
+export class VirtualFs {
+  private files = new Map<string, Uint8Array>();
+  private sortedPaths: string[] | null = null;
+  private readonly decoder = new TextDecoder("utf-8");
+  private readonly encoder = new TextEncoder();
+
+  /**
+   * When true, {@link writeJson} always emits compact JSON regardless of its
+   * `pretty` argument — the pack-optimization switch, so every stage's JSON
+   * (geometry, attachables, animations, …) is minified, not just the packaging
+   * stage's. Off by default so the Java-side VFS and un-optimized runs stay
+   * readable.
+   */
+  constructor(private minifyJson = false) {}
+
+  private invalidate(): void {
+    this.sortedPaths = null;
+  }
+
+  static normalize(path: string): string {
+    return path.replace(/\\/g, "/").replace(/^\/+/, "");
+  }
+
+  has(path: string): boolean {
+    return this.files.has(VirtualFs.normalize(path));
+  }
+
+  read(path: string): Uint8Array | undefined {
+    return this.files.get(VirtualFs.normalize(path));
+  }
+
+  readText(path: string): string | undefined {
+    const data = this.read(path);
+    if (data === undefined) return undefined;
+    return this.decoder.decode(data);
+  }
+
+  write(path: string, data: Uint8Array): void {
+    const key = VirtualFs.normalize(path);
+    // Only a NEW key changes the sorted path set. Stages routinely overwrite
+    // paths they just enumerated (the optimizer re-encoding textures in place),
+    // and invalidating there forced a full re-sort of every path in the pack on
+    // the next list().
+    if (!this.files.has(key)) this.invalidate();
+    this.files.set(key, data);
+  }
+
+  writeText(path: string, text: string): void {
+    this.write(path, this.encoder.encode(text));
+  }
+
+  writeJson(path: string, value: unknown, pretty = true): void {
+    const indent = this.minifyJson ? undefined : pretty ? 2 : undefined;
+    this.writeText(path, JSON.stringify(value, null, indent));
+  }
+
+  delete(path: string): boolean {
+    const deleted = this.files.delete(VirtualFs.normalize(path));
+    if (deleted) this.invalidate();
+    return deleted;
+  }
+
+  /** All paths, optionally filtered by prefix and/or suffix. */
+  list(options?: { prefix?: string; suffix?: string }): string[] {
+    const prefix = options?.prefix ? VirtualFs.normalize(options.prefix) : undefined;
+    const suffix = options?.suffix;
+    if (this.sortedPaths === null) {
+      this.sortedPaths = [...this.files.keys()].sort();
+    }
+    if (prefix === undefined && suffix === undefined) return [...this.sortedPaths];
+    const out: string[] = [];
+    for (const path of this.sortedPaths) {
+      if (prefix !== undefined && !path.startsWith(prefix)) continue;
+      if (suffix !== undefined && !path.endsWith(suffix)) continue;
+      out.push(path);
+    }
+    return out;
+  }
+
+  get size(): number {
+    return this.files.size;
+  }
+
+  entries(): IterableIterator<[string, Uint8Array]> {
+    return this.files.entries();
+  }
+}
